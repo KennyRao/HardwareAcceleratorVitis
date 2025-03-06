@@ -119,7 +119,7 @@ extern "C" {    // use C-style linkage for the functions enclosed within its sco
                         for (int x = 0; x < elements_per_axie4 && j + x < width; x++) {
                             for (int k = 0; k < channels && (j * channels + k) < elements_per_axie4; k++) {
                                 #pragma HLS PIPELINE
-                                // extract byte from 128-bite Axie-4 data
+                                // extract byte from 128-bit Axie-4 data
                                 unsigned char pixel_val = (unsigned char) (axie4_data >> 8 * (x * channels + k));
                                 if (row < height - 1 && j + x < width) {
                                     line_buffer[2][j + x][k] = pixel_val;
@@ -149,103 +149,126 @@ extern "C" {    // use C-style linkage for the functions enclosed within its sco
                     window[1][1][k] = line_buffer[1][col][k];
                 }
 
+                // --------------------------------------------------------------------
+                // Modified boundary logic for 'reflect' mode:
+                // We no longer skip or just copy for boundary pixels. Instead, we manually
+                // reflect the row/col indices inside the 3x3 region. This means we do the
+                // full convolution even at row=0, col=0, etc., but we "mirror" any -1 or
+                // height/width overflow indices. 
+                // 
+                // We do it in a single block for all pixels. We'll ignore the old boundary
+                // 'else if' block that just copied the original pixel. 
+                // --------------------------------------------------------------------
 
-                // apply filter if we have valid window
-                // TODO: halo cells
-                if (row > 0 && row < height - 1 && col > 0 && col < width - 1) {
-                    // buffer for output pixel
-                    unsigned char output_pixel[3];
-                    #pragma HLS ARRAY_PARTITION variable=output_pixel complete dim=0
+                // buffer for output pixel
+                unsigned char output_pixel[3];
+                #pragma HLS ARRAY_PARTITION variable=output_pixel complete dim=0
 
-                    for (int k = 0; k < channels; k++) {
-                        #pragma HLS UNROLL
-                        float sum = 0.0f;
+                // We'll compute the filtered sum for each channel, reflecting boundary if needed
+                for (int ch = 0; ch < channels; ch++) {
+                    #pragma HLS UNROLL
+                    float sum = 0.0f;
 
-                        for (int i = 0; i < 3; i++) {
-                            for (int j = 0; j < 3; j++) {
-                                #pragma HLS UNROLL
-                                sum += (float)window[i][j][k] * filter_local[i][j];
+                    // We want a 3x3 around (row,col). For each offset (i2, j2) in [-1, 0, 1],
+                    // we reflect if we go out of bounds.
+                    for (int i2 = 0; i2 < 3; i2++) {
+                        for (int j2 = 0; j2 < 3; j2++) {
+                            #pragma HLS UNROLL
+                            // compute the "actual" row/col for the window
+                            // relative to the center pixel at (row, col)
+                            int rr = row + (i2 - 1);
+                            int cc = col + (j2 - 1);
+
+                            // reflect row index if out of bounds
+                            if (rr < 0) {
+                                rr = -rr;                        // e.g., row=-1 => row=1
+                            } else if (rr >= height) {
+                                rr = (2 * height - rr - 2);      // e.g., row=height => row=height-2
                             }
+
+                            // reflect col index if out of bounds
+                            if (cc < 0) {
+                                cc = -cc;                        // e.g., col=-1 => col=1
+                            } else if (cc >= width) {
+                                cc = (2 * width - cc - 2);
+                            }
+
+                            // Now we have a "reflected" rr, cc inside [0, height-1], [0, width-1].
+                            // Next, we must figure out which row in line_buffer corresponds to 'rr'.
+                            // Because line_buffer[0] is row-1, line_buffer[1] is row, line_buffer[2] is row+1
+                            // for the *current* row. But we are streaming, so let's compute the offset:
+                            int line_idx = rr - (row - 1);
+                            // line_idx==0 => rr==row-1
+                            // line_idx==1 => rr==row
+                            // line_idx==2 => rr==row+1
+                            // but if rr < row-1 or rr>row+1, we reflect again. 
+                            // For a 3x3 kernel, we only need row±1 or col±1 for reflection, 
+                            // so we do a clamp. 
+                            if (line_idx < 0) {
+                                line_idx = 0; // clamp or reflect further
+                            }
+                            if (line_idx > 2) {
+                                line_idx = 2;
+                            }
+
+                            // same for col: we have cc but we can only access line_buffer[..][cc][ch] if cc in range
+                            // so we clamp cc to [0, width-1]
+                            if (cc < 0) {
+                                cc = 0;
+                            }
+                            if (cc >= width) {
+                                cc = width - 1;
+                            }
+
+                            // now read from line_buffer
+                            float px_val = (float) line_buffer[line_idx][cc][ch];
+                            // multiply by filter
+                            sum += px_val * filter_local[i2][j2];
                         }
+                    } // end of 3x3 loop
+
+                    // apply divisor  and clamp result
+                    int final_val = (int)(sum / divisor_local);
+                    if (final_val < 0)   final_val = 0;
+                    if (final_val > 255) final_val = 255;
+                    output_pixel[ch] = (unsigned char)final_val;
+                } // end channels loop
+
+                // now write to output
+                int pixel_idx = (row * width + col) * channels;
+                int axie4_idx = pixel_idx / elements_per_axie4;
+                int byte_offset = pixel_idx % elements_per_axie4;
+
+                // get current output value, since we only need to modify a portion of it
+                axie4_t axie4_data = output_image[axie4_idx];
+
+                for (int k = 0; k < channels && (byte_offset + k) < elements_per_axie4; k++) {
+                    #pragma HLS UNROLL
+                    // clear
+                    axie4_data &= ~(axie4_t(0xFF) << (8 * (byte_offset + k)));
+                    // set
+                    axie4_data |= (axie4_t(output_pixel[k])) << (8 * (byte_offset + k));
+                }
+
+                // write back
+                output_image[axie4_idx] = axie4_data;
+
+                // if pixel spans two Axie-4 words, handle the overflow
+                if (byte_offset + channels > elements_per_axie4) {
+                    int remaining_channels = byte_offset + channels - elements_per_axie4;
+                    axie4_t next_axie4_data = output_image[axie4_idx + 1];
                     
-
-                        // apply divisor  and clamp result
-                        int result = (int)(sum / divisor_local);
-                        if (result < 0) result = 0;
-                        if (result > 255) result = 255;
-                        output_pixel[k] = (unsigned char)result;
-                    }
-                
-
-                    // write back to output
-                    int pixel_idx = (row * width + col) * channels;
-                    int axie4_idx = pixel_idx / elements_per_axie4;
-                    int byte_offset = pixel_idx % elements_per_axie4;
-
-                    // get current output value, since we only need to modify a portion of it
-                    axie4_t axie4_data = output_image[axie4_idx];
-
-                    for (int k = 0; k < channels && (byte_offset + k) < elements_per_axie4; k++) {
+                    for (int k = 0; k < remaining_channels; k++) {
                         #pragma HLS UNROLL
-                        // clear
-                        axie4_data &= ~(axie4_t(0xFF) << (8 * (byte_offset + k)));
-                        // set
-                        axie4_data |= (axie4_t(output_pixel[k])) << (8 * (byte_offset + k));
+                        int channel_idx = elements_per_axie4 - byte_offset + k;
+                        next_axie4_data &= ~(axie4_t(0xFF) << (8 * k));
+                        next_axie4_data |= (axie4_t(output_pixel[channel_idx]) << (8 * k));
                     }
 
                     // write back
-                    output_image[axie4_idx] = axie4_data;
-
-                    // if pixel spans two Axie-4 words, handle the overflow
-                    if (byte_offset + channels > elements_per_axie4) {
-                        int remaining_channels = byte_offset + channels - elements_per_axie4;
-                        axie4_t next_axie4_data = output_image[axie4_idx + 1];
-                        
-                        for (int k = 0; k < remaining_channels; k++) {
-                            #pragma HLS UNROLL
-                            int channel_idx = elements_per_axie4 - byte_offset + k;
-                            next_axie4_data &= ~(axie4_t(0xFF) << (8 * k));
-                            next_axie4_data |= (axie4_t(output_pixel[channel_idx] << (8 * k)));
-                        }
-
-                        // write back
-                        output_image[axie4_idx + 1] = next_axie4_data;
-                    }
-                } else if (row < height && col < width) {   // for now just copy the original pixels over
-                    int pixel_idx = (row * width + col) * channels;
-                    int axie4_idx = pixel_idx / elements_per_axie4;
-                    int byte_offset = pixel_idx % elements_per_axie4;
-                    
-                    axie4_t input_axie4_data = input_image[axie4_idx];
-                    axie4_t output_axie4_data = output_image[axie4_idx];
-                
-                    for (int k = 0; k < channels && (byte_offset + k) < elements_per_axie4; k++) {
-                        #pragma HLS UNROLL
-                        unsigned char pixel_val = (unsigned char)(input_axie4_data >> (8 * (byte_offset + k)));
-                        
-                        output_axie4_data &= ~(axie4_t(0xFF) << (8 * (byte_offset + k)));
-                        output_axie4_data |= (axie4_t(pixel_val) << (8 * (byte_offset + k)));
-                    }
-                
-                    output_image[axie4_idx] = output_axie4_data;
-                
-                    if (byte_offset + channels > elements_per_axie4) {
-                        int remaining_channels = byte_offset + channels - elements_per_axie4;
-                        axie4_t next_input_axie4_data = input_image[axie4_idx + 1];
-                        axie4_t next_output_axie4_data = output_image[axie4_idx + 1];
-                        
-                        for (int k = 0; k < remaining_channels; k++) {
-                            #pragma HLS UNROLL
-                            unsigned char pixel_val = (unsigned char)(next_input_axie4_data >> (8 * k));
-                            
-                            next_output_axie4_data &= ~(axie4_t(0xFF) << (8 * k));
-                            next_output_axie4_data |= (axie4_t(pixel_val) << (8 * k));
-                        }
-                        
-                        output_image[axie4_idx + 1] = next_output_axie4_data;
-                    }
+                    output_image[axie4_idx + 1] = next_axie4_data;
                 }
-            }
-        }     
+            } // end col loop
+        } // end row loop
     }
 }
